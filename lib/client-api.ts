@@ -1,7 +1,11 @@
-import type { Board, NoteColor, NotePatch, StickyNote } from "@/lib/types";
+import type { Board, BoardWithNotes, NoteColor, NotePatch, StickyNote } from "@/lib/types";
 
 export async function createBoardRequest(): Promise<Board> {
   return request<Board>("/api/boards", { method: "POST" });
+}
+
+export async function getBoardRequest(boardId: string): Promise<BoardWithNotes> {
+  return request<BoardWithNotes>(`/api/boards/${boardId}`, { method: "GET" });
 }
 
 export async function createNoteRequest(

@@ -17,11 +17,14 @@ import {
 import { NOTE_COLORS, type NoteColor, type StickyNote } from "@/lib/types";
 
 type Position = Pick<StickyNote, "x" | "y">;
+type Activity = "idle" | "editing" | "dragging";
 
 type StickyNoteCardProps = {
   note: StickyNote;
   selected: boolean;
+  remoteActivity: { name: string; activity: Activity } | null;
   onSelect: () => void;
+  onActivityChange: (activity: Activity) => void;
   onMove: (position: Position) => void;
   onTextChange: (text: string) => void;
   onColorChange: (color: NoteColor) => void;
@@ -39,7 +42,9 @@ type DragState = {
 export function StickyNoteCard({
   note,
   selected,
+  remoteActivity,
   onSelect,
+  onActivityChange,
   onMove,
   onTextChange,
   onColorChange,
@@ -51,10 +56,17 @@ export function StickyNoteCard({
   const animationFrame = useRef<number | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSavedText = useRef(note.text);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     if (!drag.current) setPosition({ x: note.x, y: note.y });
   }, [note.x, note.y]);
+
+  useEffect(() => {
+    if (document.activeElement !== textareaRef.current) {
+      lastSavedText.current = note.text;
+    }
+  }, [note.text]);
 
   useEffect(() => {
     return () => {
@@ -66,8 +78,10 @@ export function StickyNoteCard({
   function handlePointerDown(event: ReactPointerEvent<HTMLElement>) {
     const target = event.target as HTMLElement;
     if (target.closest("textarea, button")) return;
+    if (remoteActivity?.activity === "dragging") return;
 
     onSelect();
+    onActivityChange("dragging");
     event.currentTarget.setPointerCapture(event.pointerId);
     drag.current = {
       pointerId: event.pointerId,
@@ -110,6 +124,7 @@ export function StickyNoteCard({
     nextPosition.current = null;
     setPosition(finalPosition);
     onMove(finalPosition);
+    onActivityChange("idle");
   }
 
   function handleTextChange(text: string) {
@@ -138,9 +153,11 @@ export function StickyNoteCard({
     }
   }
 
+  const remoteEditor = remoteActivity?.activity === "editing" ? remoteActivity.name : null;
+
   return (
     <article
-      className={`sticky-note sticky-note--${note.color}${selected ? " is-selected" : ""}`}
+      className={`sticky-note sticky-note--${note.color}${selected ? " is-selected" : ""}${remoteActivity ? " is-remote-active" : ""}`}
       style={{ transform: `translate3d(${position.x}px, ${position.y}px, 0)` }}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
@@ -149,6 +166,12 @@ export function StickyNoteCard({
       onClick={onSelect}
       aria-label="Sticky note"
     >
+      {remoteActivity ? (
+        <div className="remote-note-badge">
+          {remoteActivity.name} is {remoteActivity.activity}
+        </div>
+      ) : null}
+
       <div className="note-grab-row" aria-hidden="true">
         <span />
         <span />
@@ -156,12 +179,19 @@ export function StickyNoteCard({
       </div>
 
       <textarea
+        ref={textareaRef}
         aria-label="Note text"
         value={note.text}
         maxLength={NOTE_TEXT_LIMIT}
-        placeholder="Type something…"
+        placeholder={remoteEditor ? `${remoteEditor} is editing…` : "Type something…"}
+        readOnly={Boolean(remoteEditor)}
+        onFocus={() => {
+          if (!remoteEditor) onActivityChange("editing");
+        }}
         onChange={(event: ChangeEvent<HTMLTextAreaElement>) => handleTextChange(event.target.value)}
-        onBlur={() => void flushText()}
+        onBlur={() => {
+          void flushText().finally(() => onActivityChange("idle"));
+        }}
       />
 
       <div className="note-footer">

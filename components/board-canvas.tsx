@@ -2,32 +2,151 @@
 
 import Link from "next/link";
 import {
+  useEffect,
   useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 import { StickyNoteCard } from "@/components/sticky-note-card";
+import { BOARD_HEIGHT, BOARD_WIDTH, NOTE_WIDTH } from "@/lib/board-constants";
 import {
-  BOARD_HEIGHT,
-  BOARD_WIDTH,
-  NOTE_WIDTH,
-} from "@/lib/board-constants";
-import { createNoteRequest, updateNoteRequest } from "@/lib/client-api";
+  createNoteRequest,
+  getBoardRequest,
+  updateNoteRequest,
+} from "@/lib/client-api";
+import { getSupabaseBrowser } from "@/lib/supabase-browser";
 import { clampPosition } from "@/lib/validation";
-import type { BoardWithNotes, NoteColor, NotePatch } from "@/lib/types";
+import type { BoardWithNotes, NoteColor, NotePatch, StickyNote } from "@/lib/types";
 
 type BoardCanvasProps = {
   board: BoardWithNotes;
 };
+
+type Activity = "idle" | "editing" | "dragging";
+
+type Participant = {
+  clientId: string;
+  name: string;
+  activity: Activity;
+  activeNoteId: string | null;
+  onlineAt: string;
+};
+
+type CursorPosition = {
+  clientId: string;
+  name: string;
+  x: number;
+  y: number;
+  seenAt: number;
+};
+
+type LocalActivity = Pick<Participant, "activity" | "activeNoteId">;
 
 export function BoardCanvas({ board }: BoardCanvasProps) {
   const [notes, setNotes] = useState(board.notes);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [savingCount, setSavingCount] = useState(0);
   const [message, setMessage] = useState<string | null>(null);
-  const canvasRef = useRef<HTMLDivElement | null>(null);
+  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [remoteCursors, setRemoteCursors] = useState<Record<string, CursorPosition>>({});
+
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const channelRef = useRef<RealtimeChannel | null>(null);
+  const identityRef = useRef<Pick<Participant, "clientId" | "name" | "onlineAt"> | null>(null);
+  const localActivityRef = useRef<LocalActivity>({ activity: "idle", activeNoteId: null });
+  const lastCursorSentAt = useRef(0);
+
+  useEffect(() => {
+    const identity = getClientIdentity();
+    identityRef.current = identity;
+
+    const supabase = getSupabaseBrowser();
+    const channel = supabase.channel(`board:${board.id}`, {
+      config: {
+        broadcast: { self: false },
+        presence: { key: identity.clientId },
+      },
+    });
+    channelRef.current = channel;
+
+    function syncPresence() {
+      const state = channel.presenceState() as Record<string, Participant[]>;
+      const next = Object.values(state)
+        .flat()
+        .filter(isParticipant);
+      setParticipants(next);
+    }
+
+    async function reconcileFromServer() {
+      try {
+        const latest = await getBoardRequest(board.id);
+        setNotes((current) =>
+          mergeSnapshot(current, latest.notes, localActivityRef.current),
+        );
+      } catch {
+        setMessage("Live connection restored, but the latest board state could not be checked.");
+      }
+    }
+
+    channel
+      .on("presence", { event: "sync" }, syncPresence)
+      .on("broadcast", { event: "note-saved" }, ({ payload }) => {
+        const note = readBroadcastNote(payload);
+        if (!note) return;
+
+        setNotes((current) =>
+          upsertRemoteNote(current, note, localActivityRef.current),
+        );
+      })
+      .on("broadcast", { event: "cursor" }, ({ payload }) => {
+        const cursor = readCursor(payload);
+        if (!cursor || cursor.clientId === identity.clientId) return;
+
+        setRemoteCursors((current) => ({
+          ...current,
+          [cursor.clientId]: { ...cursor, seenAt: Date.now() },
+        }));
+      })
+      .on("broadcast", { event: "cursor-left" }, ({ payload }) => {
+        const clientId = readClientId(payload);
+        if (!clientId) return;
+
+        setRemoteCursors((current) => {
+          if (!(clientId in current)) return current;
+          const next = { ...current };
+          delete next[clientId];
+          return next;
+        });
+      })
+      .subscribe((status) => {
+        if (status !== "SUBSCRIBED") return;
+
+        void channel.track({
+          ...identity,
+          activity: "idle" satisfies Activity,
+          activeNoteId: null,
+        });
+        void reconcileFromServer();
+      });
+
+    const staleCursorTimer = window.setInterval(() => {
+      const cutoff = Date.now() - 3000;
+      setRemoteCursors((current) => {
+        const active = Object.entries(current).filter(([, cursor]) => cursor.seenAt >= cutoff);
+        if (active.length === Object.keys(current).length) return current;
+        return Object.fromEntries(active);
+      });
+    }, 1000);
+
+    return () => {
+      window.clearInterval(staleCursorTimer);
+      channelRef.current = null;
+      void channel.untrack();
+      void supabase.removeChannel(channel);
+    };
+  }, [board.id]);
 
   async function addNoteAt(x: number, y: number) {
     const position = clampPosition(x - NOTE_WIDTH / 2, y - 24);
@@ -42,6 +161,7 @@ export function BoardCanvas({ board }: BoardCanvasProps) {
       });
       setNotes((current) => [...current, note]);
       setSelectedId(note.id);
+      broadcastSavedNote(note);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not add the note.");
     } finally {
@@ -79,15 +199,71 @@ export function BoardCanvas({ board }: BoardCanvasProps) {
       const saved = await updateNoteRequest(board.id, noteId, patch);
       setNotes((current) =>
         current.map((note) =>
-          note.id === noteId ? { ...note, updatedAt: saved.updatedAt } : note,
+          note.id === noteId ? { ...note, ...patch, updatedAt: saved.updatedAt } : note,
         ),
       );
+      broadcastSavedNote(saved);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not save the note.");
       throw error;
     } finally {
       setSavingCount((count) => count - 1);
     }
+  }
+
+  function broadcastSavedNote(note: StickyNote) {
+    const channel = channelRef.current;
+    if (!channel) return;
+
+    void channel.send({
+      type: "broadcast",
+      event: "note-saved",
+      payload: { note },
+    });
+  }
+
+  function setLocalActivity(activity: Activity, activeNoteId: string | null) {
+    localActivityRef.current = { activity, activeNoteId };
+
+    const channel = channelRef.current;
+    const identity = identityRef.current;
+    if (!channel || !identity) return;
+
+    void channel.track({ ...identity, activity, activeNoteId });
+  }
+
+  function broadcastCursor(event: ReactPointerEvent<HTMLDivElement>) {
+    const channel = channelRef.current;
+    const identity = identityRef.current;
+    if (!channel || !identity) return;
+
+    const now = performance.now();
+    if (now - lastCursorSentAt.current < 50) return;
+    lastCursorSentAt.current = now;
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    void channel.send({
+      type: "broadcast",
+      event: "cursor",
+      payload: {
+        clientId: identity.clientId,
+        name: identity.name,
+        x: clamp(event.clientX - rect.left, 0, BOARD_WIDTH),
+        y: clamp(event.clientY - rect.top, 0, BOARD_HEIGHT),
+      },
+    });
+  }
+
+  function broadcastCursorLeft() {
+    const channel = channelRef.current;
+    const identity = identityRef.current;
+    if (!channel || !identity) return;
+
+    void channel.send({
+      type: "broadcast",
+      event: "cursor-left",
+      payload: { clientId: identity.clientId },
+    });
   }
 
   async function copyLink() {
@@ -100,6 +276,10 @@ export function BoardCanvas({ board }: BoardCanvasProps) {
     }
   }
 
+  const remoteParticipants = participants.filter(
+    (participant) => participant.clientId !== identityRef.current?.clientId,
+  );
+
   return (
     <main className="board-shell">
       <header className="board-toolbar">
@@ -109,6 +289,10 @@ export function BoardCanvas({ board }: BoardCanvasProps) {
         </div>
 
         <div className="toolbar-actions">
+          <div className="presence-pill" title={remoteParticipants.map((person) => person.name).join(", ")}>
+            <span className="presence-dot" aria-hidden="true" />
+            {Math.max(1, participants.length)} online
+          </div>
           <span className={`save-state${savingCount ? " is-saving" : ""}`}>
             {savingCount ? "Saving…" : "Saved"}
           </span>
@@ -123,14 +307,17 @@ export function BoardCanvas({ board }: BoardCanvasProps) {
 
       {message ? <div className="board-message" role="status">{message}</div> : null}
 
-      <div className="board-hint">Double-click empty space to add a note. Drag any note to move it.</div>
+      <div className="board-hint">
+        Double-click empty space to add a note. Changes appear live in other open tabs.
+      </div>
 
       <div className="canvas-viewport" ref={viewportRef}>
         <div
-          ref={canvasRef}
           className="board-canvas"
           style={{ width: BOARD_WIDTH, height: BOARD_HEIGHT }}
           onDoubleClick={handleCanvasDoubleClick}
+          onPointerMove={broadcastCursor}
+          onPointerLeave={broadcastCursorLeft}
           onPointerDown={(event: ReactPointerEvent<HTMLDivElement>) => {
             if (event.target === event.currentTarget) setSelectedId(null);
           }}
@@ -145,26 +332,173 @@ export function BoardCanvas({ board }: BoardCanvasProps) {
             </button>
           ) : null}
 
-          {notes.map((note) => (
-            <StickyNoteCard
-              key={note.id}
-              note={note}
-              selected={selectedId === note.id}
-              onSelect={() => setSelectedId(note.id)}
-              onMove={(position) => {
-                updateLocal(note.id, position);
-                void persist(note.id, position).catch(() => undefined);
-              }}
-              onTextChange={(text) => updateLocal(note.id, { text })}
-              onColorChange={(color: NoteColor) => {
-                updateLocal(note.id, { color });
-                void persist(note.id, { color }).catch(() => undefined);
-              }}
-              onPersistText={(text) => persist(note.id, { text })}
-            />
+          {notes.map((note) => {
+            const remoteActivity = remoteParticipants.find(
+              (person) => person.activeNoteId === note.id && person.activity !== "idle",
+            );
+
+            return (
+              <StickyNoteCard
+                key={note.id}
+                note={note}
+                selected={selectedId === note.id}
+                remoteActivity={remoteActivity
+                  ? { name: remoteActivity.name, activity: remoteActivity.activity }
+                  : null}
+                onSelect={() => setSelectedId(note.id)}
+                onActivityChange={(activity) =>
+                  setLocalActivity(activity, activity === "idle" ? null : note.id)
+                }
+                onMove={(position) => {
+                  updateLocal(note.id, position);
+                  void persist(note.id, position).catch(() => undefined);
+                }}
+                onTextChange={(text) => updateLocal(note.id, { text })}
+                onColorChange={(color: NoteColor) => {
+                  updateLocal(note.id, { color });
+                  void persist(note.id, { color }).catch(() => undefined);
+                }}
+                onPersistText={(text) => persist(note.id, { text })}
+              />
+            );
+          })}
+
+          {Object.values(remoteCursors).map((cursor) => (
+            <div
+              key={cursor.clientId}
+              className="remote-cursor"
+              style={{ left: cursor.x, top: cursor.y }}
+              aria-hidden="true"
+            >
+              <span className="remote-cursor-arrow">◆</span>
+              <span className="remote-cursor-name">{cursor.name}</span>
+            </div>
           ))}
         </div>
       </div>
     </main>
   );
+}
+
+function getClientIdentity(): Pick<Participant, "clientId" | "name" | "onlineAt"> {
+  const storageKey = "pocket-board-client-id";
+  let clientId = window.sessionStorage.getItem(storageKey);
+
+  if (!clientId) {
+    clientId = crypto.randomUUID();
+    window.sessionStorage.setItem(storageKey, clientId);
+  }
+
+  const suffix = clientId.replaceAll("-", "").slice(-4).toUpperCase();
+  return {
+    clientId,
+    name: `Guest ${suffix}`,
+    onlineAt: new Date().toISOString(),
+  };
+}
+
+function upsertRemoteNote(
+  current: StickyNote[],
+  incoming: StickyNote,
+  localActivity: LocalActivity,
+): StickyNote[] {
+  const index = current.findIndex((note) => note.id === incoming.id);
+  if (index === -1) return [...current, incoming];
+
+  const existing = current[index];
+  if (Date.parse(incoming.updatedAt) < Date.parse(existing.updatedAt)) return current;
+
+  let merged = incoming;
+  if (localActivity.activeNoteId === incoming.id) {
+    if (localActivity.activity === "editing") {
+      merged = { ...incoming, text: existing.text };
+    } else if (localActivity.activity === "dragging") {
+      merged = { ...incoming, x: existing.x, y: existing.y };
+    }
+  }
+
+  const next = [...current];
+  next[index] = merged;
+  return next;
+}
+
+function mergeSnapshot(
+  current: StickyNote[],
+  latest: StickyNote[],
+  localActivity: LocalActivity,
+): StickyNote[] {
+  return latest.map((incoming) => {
+    const existing = current.find((note) => note.id === incoming.id);
+    if (!existing) return incoming;
+
+    if (localActivity.activeNoteId !== incoming.id) return incoming;
+    if (localActivity.activity === "editing") return { ...incoming, text: existing.text };
+    if (localActivity.activity === "dragging") {
+      return { ...incoming, x: existing.x, y: existing.y };
+    }
+    return incoming;
+  });
+}
+
+function readBroadcastNote(payload: unknown): StickyNote | null {
+  if (!isRecord(payload) || !isStickyNote(payload.note)) return null;
+  return payload.note;
+}
+
+function readCursor(payload: unknown): Omit<CursorPosition, "seenAt"> | null {
+  if (!isRecord(payload)) return null;
+  if (
+    typeof payload.clientId !== "string" ||
+    typeof payload.name !== "string" ||
+    typeof payload.x !== "number" ||
+    typeof payload.y !== "number"
+  ) {
+    return null;
+  }
+
+  return {
+    clientId: payload.clientId,
+    name: payload.name,
+    x: payload.x,
+    y: payload.y,
+  };
+}
+
+function readClientId(payload: unknown): string | null {
+  return isRecord(payload) && typeof payload.clientId === "string"
+    ? payload.clientId
+    : null;
+}
+
+function isParticipant(value: unknown): value is Participant {
+  return (
+    isRecord(value) &&
+    typeof value.clientId === "string" &&
+    typeof value.name === "string" &&
+    (value.activity === "idle" || value.activity === "editing" || value.activity === "dragging") &&
+    (value.activeNoteId === null || typeof value.activeNoteId === "string") &&
+    typeof value.onlineAt === "string"
+  );
+}
+
+function isStickyNote(value: unknown): value is StickyNote {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.boardId === "string" &&
+    typeof value.text === "string" &&
+    typeof value.color === "string" &&
+    typeof value.x === "number" &&
+    typeof value.y === "number" &&
+    typeof value.createdAt === "string" &&
+    typeof value.updatedAt === "string"
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
 }

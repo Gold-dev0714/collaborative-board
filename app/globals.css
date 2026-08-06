@@ -395,3 +395,82 @@ h1 {
   .board-id, .save-state, .secondary-button { display: none; }
   .board-hint { max-width: calc(100vw - 30px); overflow: hidden; text-overflow: ellipsis; }
 }
+
+.presence-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: #fff;
+  font-size: 0.76rem;
+  white-space: nowrap;
+}
+
+.presence-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4a9d55;
+  box-shadow: 0 0 0 3px rgba(74, 157, 85, 0.16);
+}
+
+.sticky-note.is-remote-active {
+  box-shadow: 0 0 0 3px rgba(111, 74, 200, 0.28), 0 15px 27px rgba(36, 37, 33, 0.17);
+}
+
+.remote-note-badge {
+  position: absolute;
+  top: -25px;
+  left: 8px;
+  max-width: 200px;
+  overflow: hidden;
+  border-radius: 7px;
+  padding: 4px 7px;
+  color: #fff;
+  background: #6344a8;
+  font-size: 0.67rem;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.sticky-note textarea[readonly] {
+  cursor: not-allowed;
+  opacity: 0.68;
+}
+
+.remote-cursor {
+  position: absolute;
+  z-index: 40;
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  transform: translate(-4px, -4px);
+  color: #563b99;
+  pointer-events: none;
+  transition: left 45ms linear, top 45ms linear;
+}
+
+.remote-cursor-arrow {
+  font-size: 0.72rem;
+  transform: rotate(45deg);
+}
+
+.remote-cursor-name {
+  margin-top: 8px;
+  border-radius: 5px;
+  padding: 3px 6px;
+  color: #fff;
+  background: #563b99;
+  font-size: 0.62rem;
+  white-space: nowrap;
+}
+
+@media (max-width: 680px) {
+  .presence-pill { display: none; }
+}
