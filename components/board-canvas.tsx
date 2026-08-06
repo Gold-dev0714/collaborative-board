@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import {
   useRef,
   useState,
@@ -14,7 +15,7 @@ import {
 } from "@/lib/board-constants";
 import { createNoteRequest, updateNoteRequest } from "@/lib/client-api";
 import { clampPosition } from "@/lib/validation";
-import type { BoardWithNotes, NoteColor, NotePatch, StickyNote } from "@/lib/types";
+import type { BoardWithNotes, NoteColor, NotePatch } from "@/lib/types";
 
 type BoardCanvasProps = {
   board: BoardWithNotes;
@@ -103,7 +104,7 @@ export function BoardCanvas({ board }: BoardCanvasProps) {
     <main className="board-shell">
       <header className="board-toolbar">
         <div>
-          <a className="brand-link" href="/">Pocket Board</a>
+          <Link className="brand-link" href="/">Pocket Board</Link>
           <span className="board-id">Board {board.id.slice(0, 8)}</span>
         </div>
 
