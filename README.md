@@ -21,7 +21,7 @@ I kept the browser independent from the database provider. The client talks to s
 
 ## Run locally
 
-Requirements: Node.js 22 or newer and a Supabase project.
+Requirements: Node.js 20.9 or newer and a Supabase project.
 
 1. Install dependencies:
 
@@ -77,3 +77,15 @@ The shortest path is Vercel:
 - Text writes are debounced for 550 ms and flushed on blur.
 - Coordinates are bounded in both the client and API validation.
 - A short save indicator shows whether writes are in progress.
+
+
+## Realtime configuration
+
+Part 2 uses a browser-safe Supabase publishable key for Broadcast and Presence. Add these alongside the server-only values in `.env.local`:
+
+```env
+NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your-publishable-or-anon-key
+```
+
+The secret/service-role key remains server-only. No anonymous table policies are required for this implementation.
